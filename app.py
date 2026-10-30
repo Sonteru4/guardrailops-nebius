@@ -88,7 +88,8 @@ with gr.Blocks(title="GuardrailOps") as demo:
             verdict = gr.Markdown()
             answer = gr.Textbox(label="Released answer (or block reason)", lines=4)
             trace = gr.Dataframe(headers=["stage", "result", "score", "detail"],
-                                 label="Audit trace", wrap=True)
+                                 label="Audit trace", wrap=True,
+                                 column_widths=["18%", "12%", "10%", "60%"])
     gr.Examples(EXAMPLES, inputs=[query, kill])
     btn.click(run, inputs=[query, kill, model, context], outputs=[verdict, answer, trace])
     query.submit(run, inputs=[query, kill, model, context], outputs=[verdict, answer, trace])

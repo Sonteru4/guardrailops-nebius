@@ -86,7 +86,8 @@ def screen_input(query: str) -> tuple[bool, str]:
     q = query.lower()
     for pat in INJECTION_PATTERNS:
         if re.search(pat, q):
-            return False, f"matched injection pattern: {pat}"
+            hit = re.search(pat, q).group(0)
+            return False, f"prompt-injection phrase detected: '{hit}'"
     return True, "no injection pattern matched"
 
 
