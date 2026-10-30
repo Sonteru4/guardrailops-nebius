@@ -55,13 +55,39 @@ def tokenize(text: str) -> set[str]:
     return {t for t in re.findall(r"[a-z0-9]+", text.lower()) if len(t) > 2}
 
 
-def mock_retrieve(query: str) -> str:
-    """Deterministic mock context for offline demos."""
-    return (
-        "Digital goods refund policy: customers may request a refund within 14 days "
-        "if the download was not completed. Partial downloads are reviewed case by case. "
-        "Chargebacks without contacting support may suspend the account."
-    )
+DEFAULT_CONTEXT = (
+    "Digital goods refund policy: customers may request a refund within 14 days "
+    "if the download was not completed. Partial downloads are reviewed case by case. "
+    "Chargebacks without contacting support may suspend the account."
+)
+
+
+def mock_retrieve(query: str, context: str | None = None) -> str:
+    """Return the policy context the answer must be grounded in.
+
+    Callers (CLI, Gradio app) can pass their own policy text; otherwise a
+    fixed demo policy is used.
+    """
+    return (context or "").strip() or DEFAULT_CONTEXT
+
+
+INJECTION_PATTERNS = [
+    r"ignore (all |the |any |previous |prior |your )*(instructions|policy|policies|rules|context)",
+    r"disregard (the |all |your )*(instructions|policy|rules|context)",
+    r"(reveal|print|show).{0,20}system prompt",
+    r"\bjailbreak\b",
+    r"developer mode",
+    r"pretend (you are|to be) .{0,40}(no|without) (rules|restrictions)",
+]
+
+
+def screen_input(query: str) -> tuple[bool, str]:
+    """Cheap pre-model input screen for common prompt-injection phrasing."""
+    q = query.lower()
+    for pat in INJECTION_PATTERNS:
+        if re.search(pat, q):
+            return False, f"matched injection pattern: {pat}"
+    return True, "no injection pattern matched"
 
 
 def mock_generate(query: str, context: str) -> tuple[str, float]:
@@ -71,7 +97,7 @@ def mock_generate(query: str, context: str) -> tuple[str, float]:
         "was not completed. Partial downloads are reviewed case by case."
     )
     confidence = 0.82
-    if "ignore policy" in query.lower() or "make up" in query.lower():
+    if "make up" in query.lower() or "hallucinate" in query.lower():
         # Deliberately ungrounded: no overlap with refund policy context.
         answer = "Purple comets grant unlimited store credit on Mars colonies every Tuesday."
         confidence = 0.4
@@ -86,6 +112,9 @@ SYSTEM_PROMPT = (
     "support an answer, reply exactly: INSUFFICIENT_CONTEXT. Keep answers under "
     "80 words."
 )
+
+
+LAST_CALL: dict[str, Any] = {}
 
 
 def nebius_generate(query: str, context: str, model_id: str) -> tuple[str, float]:
@@ -105,7 +134,7 @@ def nebius_generate(query: str, context: str, model_id: str) -> tuple[str, float
     body = {
         "model": model_id,
         "temperature": 0.2,
-        "max_tokens": 400,
+        "max_tokens": int(os.getenv("MAX_TOKENS", "1500")),
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"},
@@ -120,9 +149,20 @@ def nebius_generate(query: str, context: str, model_id: str) -> tuple[str, float
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    import time
+
+    t0 = time.time()
+    with urllib.request.urlopen(req, timeout=90) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-    answer = (data["choices"][0]["message"].get("content") or "").strip()
+    LAST_CALL.clear()
+    LAST_CALL["latency_s"] = round(time.time() - t0, 2)
+    LAST_CALL["response_model"] = data.get("model", model_id)
+    usage = data.get("usage") or {}
+    LAST_CALL["prompt_tokens"] = usage.get("prompt_tokens")
+    LAST_CALL["completion_tokens"] = usage.get("completion_tokens")
+    msg = data["choices"][0]["message"]
+    LAST_CALL["finish_reason"] = data["choices"][0].get("finish_reason")
+    answer = (msg.get("content") or "").strip()
     # Some reasoning models wrap thinking in <think> tags; keep only the answer.
     answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.S).strip()
     confidence = 0.3 if "INSUFFICIENT_CONTEXT" in answer else 0.8
@@ -149,7 +189,7 @@ def eval_score(answer: str, query: str) -> float:
     return max(0.0, min(1.0, 0.6 * overlap + 0.4 * length_ok))
 
 
-def run_pipeline(query: str) -> PipelineResult:
+def run_pipeline(query: str, context: str | None = None) -> PipelineResult:
     stages: list[StageResult] = []
     mock_mode = _env_bool("MOCK_MODE", True)
     kill = _env_bool("KILL_SWITCH", False)
@@ -176,7 +216,17 @@ def run_pipeline(query: str) -> PipelineResult:
         )
     stages.append(StageResult("kill_switch", True, "inactive"))
 
-    context = mock_retrieve(query)
+    ok, why = screen_input(query)
+    stages.append(StageResult("input_screen", ok, why))
+    if not ok:
+        return PipelineResult(
+            status="blocked",
+            answer="Blocked: input looks like a prompt-injection attempt. No model call was made.",
+            stages=stages,
+            meta=meta,
+        )
+
+    context = mock_retrieve(query, context)
     stages.append(StageResult("retrieve", True, f"context_chars={len(context)}"))
 
     if mock_mode:
@@ -187,6 +237,8 @@ def run_pipeline(query: str) -> PipelineResult:
     else:
         try:
             answer, confidence = nebius_generate(query, context, model_id)
+            for k, v in LAST_CALL.items():
+                meta[f"nebius_{k}"] = v
             stages.append(
                 StageResult(
                     "generate",
@@ -203,6 +255,22 @@ def run_pipeline(query: str) -> PipelineResult:
                 stages=stages,
                 meta=meta,
             )
+
+    if not answer or "INSUFFICIENT_CONTEXT" in answer:
+        stages.append(
+            StageResult(
+                "grounding",
+                False,
+                "model reported the context does not support an answer",
+                score=0.0,
+            )
+        )
+        return PipelineResult(
+            status="blocked",
+            answer="Blocked: the policy context does not support an answer (model replied INSUFFICIENT_CONTEXT).",
+            stages=stages,
+            meta=meta,
+        )
 
     g = grounding_score(answer, context)
     g_pass = g >= 0.45

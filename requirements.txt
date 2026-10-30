@@ -1,2 +1,4 @@
-# Minimal deps for mock-mode demo
+# Runtime pipeline is standard library only.
+# gradio powers the hosted demo (app.py / Hugging Face Space); pytest runs the tests.
+gradio>=5.0
 pytest>=8.0.0
