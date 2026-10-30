@@ -1,0 +1,2 @@
+# Minimal deps for mock-mode demo
+pytest>=8.0.0
